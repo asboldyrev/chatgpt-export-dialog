@@ -9,6 +9,7 @@
 - Изображения копируются в папку диалога (assets/)
 """
 
+import argparse
 import json
 import os
 import re
@@ -29,7 +30,7 @@ def get_project_id(conv: dict) -> str | None:
     В бэкапе ChatGPT проект задаётся полем gizmo_id (или conversation_template_id).
     Возвращает ID проекта для имени папки или None — диалог вне проекта.
     """
-    raw = conv.get("gizmo_id") or conv.get("conversation_template_id")
+    raw = conv.get("gizmo_id") or conv.get("conversation_template_id") or conv.get("metadata", {}).get("gizmo_id")
     if not raw or not str(raw).strip():
         return None
     return str(raw).strip()
@@ -37,51 +38,87 @@ def get_project_id(conv: dict) -> str | None:
 
 def sanitize_folder_name(s: str) -> str:
     """Имя папки проекта: только безопасные символы."""
-    s = re.sub(r'[<>:"/\\|?*\s]', "_", s)
-    s = s.strip("_.") or "project"
+    # Заменяем все небезопасные символы на подчеркивание
+    # Включаем пробелы, управляющие символы, запрещенные для файловой системы
+    s = re.sub(r'[<>:"/\\|?*\s\r\n\t]', "_", s)
+    # Удаляем ведущие и конечные подчеркивания и точки
+    s = s.strip("_.")
+    # Заменяем множественные подчеркивания на одно
+    s = re.sub(r'_+', '_', s)
+    # Если после очистки строка пуста, используем значение по умолчанию
+    if not s:
+        s = "project"
+    # Ограничиваем длину
     return s[:MAX_TITLE_LEN]
 
 
 def sanitize_filename(s: str) -> str:
-    s = re.sub(r'[<>:"/\\|?*]', "_", s)
-    s = s.strip().strip(".") or "untitled"
+    # Заменяем все небезопасные символы на подчеркивание (включая пробелы)
+    s = re.sub(r'[<>:"/\\|?*\s\r\n\t]', "_", s)
+    # Удаляем ведущие и конечные подчеркивания и точки
+    s = s.strip("_.")
+    # Заменяем множественные подчеркивания на одно
+    s = re.sub(r'_+', '_', s)
+    # Если после очистки строка пуста, используем значение по умолчанию
+    if not s:
+        s = "untitled"
+    # Ограничиваем длину
     return s[:MAX_TITLE_LEN]
 
 
-def build_file_map():
+def build_file_map(base_path=None):
     """Строит маппинг file_id / asset_pointer -> локальный путь."""
+    if base_path is None:
+        base_path = BASE
     file_map = {}
-    for f in os.listdir(BASE):
-        path = BASE / f
+    
+    def add_mapping(fid, path):
+        """Добавляет отображение с дедупликацией: выбираем более полный путь."""
+        existing = file_map.get(fid)
+        if existing is None:
+            file_map[fid] = path
+        else:
+            # Выбираем путь с большей длиной (эвристика: более полный путь)
+            if len(str(path)) > len(str(existing)):
+                file_map[fid] = path
+            # Иначе оставляем существующий
+    
+    # Файлы в корневой папке (префикс file-)
+    for f in os.listdir(base_path):
+        path = base_path / f
         if path.is_file() and f.startswith("file-"):
             parts = f.split("-", 2)
             if len(parts) >= 2:
                 fid = "file-" + parts[1]
-                file_map[fid] = path
-    user_dir = BASE / "user-FpDwdx0tII6eDxp5lApJkSsL"
+                add_mapping(fid, path)
+    
+    # Файлы в user-FpDwdx0tII6eDxp5lApJkSsL (префикс file_)
+    user_dir = base_path / "user-FpDwdx0tII6eDxp5lApJkSsL"
     if user_dir.is_dir():
         for f in os.listdir(user_dir):
             if f.startswith("file_"):
                 # sediment://file_00000000c46061f9bd587888eb5e6ce5
                 h = f.split("-")[0]
-                file_map["sediment://" + h] = user_dir / f
-    dalle_dir = BASE / "dalle-generations"
+                add_mapping("sediment://" + h, user_dir / f)
+    
+    # Файлы в dalle-generations
+    dalle_dir = base_path / "dalle-generations"
     if dalle_dir.is_dir():
         for f in os.listdir(dalle_dir):
             path = dalle_dir / f
-            if path.is_file():
-                # id может быть в имени файла
-                if f.startswith("file-"):
-                    parts = f.split("-", 2)
-                    if len(parts) >= 2:
-                        file_map["file-" + parts[1]] = path
+            if path.is_file() and f.startswith("file-"):
+                parts = f.split("-", 2)
+                if len(parts) >= 2:
+                    fid = "file-" + parts[1]
+                    add_mapping(fid, path)
+    
     return file_map
 
 
 def resolve_asset_path(part: dict, file_map: dict) -> str | None:
     if not isinstance(part, dict):
         return None
-    ptr = part.get("asset_pointer") or part.get("content_type")
+    ptr = part.get("asset_pointer")
     if not ptr:
         return None
     # file-service://file-85nHsLezMWbFESUDBRMhQE
@@ -94,26 +131,27 @@ def resolve_asset_path(part: dict, file_map: dict) -> str | None:
 
 
 def get_ordered_message_ids(mapping: dict) -> list[str]:
-    root_id = "client-created-root"
-    if root_id not in mapping:
-        for nid, node in mapping.items():
-            if node.get("parent") is None and (node.get("children") or node.get("message") is None):
-                root_id = nid
-                break
-    root = mapping.get(root_id)
-    if not root:
-        return []
-    children = root.get("children") or []
-    cur = children[0] if children else None
-    order = []
-    while cur and cur in mapping:
-        node = mapping[cur]
+    """
+    Возвращает список ID сообщений в хронологическом порядке, исключая системные.
+    Собирает все сообщения из mapping, имеющие message с ролью не system,
+    и сортирует по времени создания (create_time) если оно есть, иначе по ID.
+    """
+    candidates = []
+    for nid, node in mapping.items():
         msg = node.get("message")
-        if msg and msg.get("author", {}).get("role") != "system":
-            order.append(cur)
-        children = node.get("children") or []
-        cur = children[0] if children else None
-    return order
+        if not msg:
+            continue
+        role = msg.get("author", {}).get("role")
+        if role == "system":
+            continue
+        # Получаем время создания
+        create_time = msg.get("create_time")
+        # Если время None, используем 0
+        candidates.append((nid, create_time if create_time is not None else 0))
+    
+    # Сортировка по времени (возрастание), затем по ID для стабильности
+    candidates.sort(key=lambda x: (x[1], x[0]))
+    return [cid for cid, _ in candidates]
 
 
 def extract_parts_text_and_images(msg: dict, file_map: dict) -> tuple[list[str], list[tuple[str, str]]]:
@@ -134,8 +172,8 @@ def extract_parts_text_and_images(msg: dict, file_map: dict) -> tuple[list[str],
     return texts, images
 
 
-def export_conversation(conv: dict, folder_name: str, file_map: dict, project_folder: str | None = None) -> None:
-    """Экспортирует один диалог. project_folder — папка проекта внутри dialogs_export или None для отдельного диалога."""
+def export_conversation(conv: dict, folder_name: str, file_map: dict, project_folder: str | None = None, output_dir: Path = OUTPUT_DIR) -> None:
+    """Экспортирует один диалог. project_folder — папка проекта внутри output_dir или None для отдельного диалога."""
     title = (conv.get("title") or "New chat").strip() or "Без названия"
     cid = conv.get("id") or conv.get("conversation_id") or "conv"
     create_ts = conv.get("create_time")
@@ -149,9 +187,9 @@ def export_conversation(conv: dict, folder_name: str, file_map: dict, project_fo
         date_str = ""
 
     if project_folder:
-        out_path = OUTPUT_DIR / project_folder / folder_name
+        out_path = output_dir / project_folder / folder_name
     else:
-        out_path = OUTPUT_DIR / folder_name
+        out_path = output_dir / folder_name
     out_path.mkdir(parents=True, exist_ok=True)
     assets_path = out_path / "assets"
     assets_path.mkdir(exist_ok=True)
@@ -241,10 +279,19 @@ def export_conversation(conv: dict, folder_name: str, file_map: dict, project_fo
 
 
 def main():
-    if not CONVERSATIONS_JSON.exists():
-        print("Файл conversations.json не найден.")
+    import argparse
+    parser = argparse.ArgumentParser(description='Экспорт диалогов ChatGPT из папки бэкапа.')
+    parser.add_argument('path', nargs='?', default='.', help='Путь к папке с бэкапом (по умолчанию текущая директория)')
+    args = parser.parse_args()
+
+    base_path = Path(args.path).resolve()
+    conversations_json = base_path / "conversations.json"
+    output_dir = base_path / "dialogs_export"
+
+    if not conversations_json.exists():
+        print(f"Файл conversations.json не найден в {base_path}.")
         return
-    with open(CONVERSATIONS_JSON, "r", encoding="utf-8") as f:
+    with open(conversations_json, "r", encoding="utf-8") as f:
         conversations = json.load(f)
     if not isinstance(conversations, list):
         conversations = [conversations]
@@ -265,19 +312,19 @@ def main():
         else:
             standalone.append(conv)
 
-    file_map = build_file_map()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    file_map = build_file_map(base_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     exported = 0
 
     for project_id, convs in sorted(by_project.items()):
         project_folder = sanitize_folder_name(project_id)
-        (OUTPUT_DIR / project_folder).mkdir(parents=True, exist_ok=True)
+        (output_dir / project_folder).mkdir(parents=True, exist_ok=True)
         convs.sort(key=sort_key)
         for local_i, conv in enumerate(convs, 1):
             title = (conv.get("title") or "New chat").strip() or "Без названия"
             folder_name = f"{local_i:03d}_{sanitize_filename(title)}"
             try:
-                export_conversation(conv, folder_name, file_map, project_folder=project_folder)
+                export_conversation(conv, folder_name, file_map, project_folder=project_folder, output_dir=output_dir)
                 exported += 1
                 print(f"  [{project_folder}] {folder_name} — {title[:50]}")
             except Exception as e:
@@ -289,7 +336,7 @@ def main():
         title = (conv.get("title") or "New chat").strip() or "Без названия"
         folder_name = f"{i:03d}_{sanitize_filename(title)}"
         try:
-            export_conversation(conv, folder_name, file_map, project_folder=None)
+            export_conversation(conv, folder_name, file_map, project_folder=None, output_dir=output_dir)
             exported += 1
             print(f"  (отдельный) {folder_name} — {title[:50]}")
         except Exception as e:
@@ -298,16 +345,20 @@ def main():
             traceback.print_exc()
 
     # README: структура и пояснение
-    write_export_readme(by_project, standalone)
+    write_export_readme(by_project, standalone, output_dir=output_dir)
 
     print(f"\nГотово. Экспортировано {exported} диалогов.")
     print(f"  Проектов (по gizmo_id/conversation_template_id): {len(by_project)}")
     print(f"  Отдельных диалогов (без проекта): {len(standalone)}")
-    print(f"Папка: {OUTPUT_DIR}")
+    print(f"Папка: {output_dir}")
 
 
-def write_export_readme(by_project: dict, standalone: list) -> None:
-    """Пишет README.md в dialogs_export с описанием структуры."""
+def write_export_readme(by_project: dict, standalone: list, output_dir: Path = OUTPUT_DIR) -> None:
+    """Пишет README.md в output_dir с описанием структуры."""
+    def sort_key(c):
+        t = c.get("create_time") or 0
+        return (t, c.get("id", ""))
+
     lines = [
         "# Экспорт диалогов ChatGPT",
         "",
@@ -324,10 +375,11 @@ def write_export_readme(by_project: dict, standalone: list) -> None:
     for project_id in sorted(by_project.keys()):
         folder = sanitize_folder_name(project_id)
         convs = by_project[project_id]
+        convs_sorted = sorted(convs, key=sort_key)
         lines.append(f"### {folder}")
         lines.append(f"*(id: `{project_id}`)*")
         lines.append("")
-        for i, conv in enumerate(sorted(convs, key=lambda c: (c.get("create_time") or 0)), 1):
+        for i, conv in enumerate(convs_sorted, 1):
             title = (conv.get("title") or "New chat").strip() or "Без названия"
             sub = f"{i:03d}_{sanitize_filename(title)}"
             lines.append(f"- [{title}]({folder}/{sub}/dialogue.md)")
@@ -336,12 +388,13 @@ def write_export_readme(by_project: dict, standalone: list) -> None:
     lines.append("")
     lines.append("## Отдельные диалоги")
     lines.append("")
-    for i, conv in enumerate(standalone, 1):
+    standalone_sorted = sorted(standalone, key=sort_key)
+    for i, conv in enumerate(standalone_sorted, 1):
         title = (conv.get("title") or "New chat").strip() or "Без названия"
         sub = f"{i:03d}_{sanitize_filename(title)}"
         lines.append(f"- [{title}]({sub}/dialogue.md)")
     lines.append("")
-    (OUTPUT_DIR / "README.md").write_text("\n".join(lines), encoding="utf-8")
+    (output_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 if __name__ == "__main__":
