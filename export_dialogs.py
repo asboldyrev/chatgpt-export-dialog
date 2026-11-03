@@ -1,401 +1,630 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Экспорт разговоров ChatGPT в отдельные Markdown-папки.
+
+Поддерживаются каталоги экспорта, одиночные JSON, внешние ZIP и вложенные ZIP,
+разбитые conversations-NNN.json, mapping/current_node и плоские messages,
+file-service:// / sediment:// указатели, файлы .dat и attachments.
+
+Python 3.10+, только стандартная библиотека. Исходные архивы не изменяются.
+
+Примеры:
+    python export_dialogs.py ~/Downloads/chatgpt-export.zip
+    python export_dialogs.py ~/Downloads/unpacked_export -o ~/Documents/dialogs
+    python export_dialogs.py conversations.json --all-branches
 """
-Экспорт бэкапа ChatGPT: каждый диалог — отдельная папка.
-Проект определяется по полю в данных: gizmo_id или conversation_template_id.
-Если поле задано — диалог попадает в папку проекта; иначе — в отдельные диалоги.
-- dialogue.md — сам диалог в markdown
-- Длинные тексты (>2500 символов) — в отдельных txt файлах
-- Изображения копируются в папку диалога (assets/)
-"""
+
+from __future__ import annotations
 
 import argparse
+import hashlib
 import json
-import os
 import re
 import shutil
-from datetime import datetime
+import sys
+import tempfile
+import zipfile
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
-BASE = Path(__file__).resolve().parent
-CONVERSATIONS_JSON = BASE / "conversations.json"
-OUTPUT_DIR = BASE / "dialogs_export"
 LONG_TEXT_THRESHOLD = 2500
 MAX_TITLE_LEN = 80
+MAX_NESTING = 6
+# Защита от распаковки архивов-бомб; реальные экспорты могут быть очень большими.
+MAX_UNCOMPRESSED_TOTAL = 100 * (1024 ** 3)
+CONVERSATIONS_PATTERN = re.compile(r"^conversations(?:[-_]\d+)?\.json$", re.IGNORECASE)
+FILE_DASH_PATTERN = re.compile(r"(file-[A-Za-z0-9]+)")
+FILE_UNDER_PATTERN = re.compile(r"(file_[0-9a-fA-F]{20,})")
+MEDIA_TYPES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg",
+    ".mp3", ".m4a", ".ogg", ".wav", ".flac", ".mp4", ".mov", ".webm",
+}
+IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+def log_warning(message: str) -> None:
+    print(f"Предупреждение: {message}", file=sys.stderr)
+
+
+def sanitize_filename(value: object, fallback: str = "untitled") -> str:
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", str(value or ""))
+    text = re.sub(r"_+", "_", text).strip("_. ")[:MAX_TITLE_LEN].rstrip("_. ")
+    if not text:
+        text = fallback
+    if text.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        text = "_" + text
+    return text
+
+
+def markdown_escape(value: object) -> str:
+    return re.sub(r"([\\`*\[\]<>])", r"\\\1", str(value))
+
+
+def md_url(path: Path | str) -> str:
+    from urllib.parse import quote
+    return quote(str(path).replace("\\", "/"), safe="/-_.")
+
+
+def to_timestamp(value: object) -> float:
+    if value is None:
+        return 0.0
+    try:
+        stamp = float(value)
+        return stamp / 1000 if abs(stamp) > 1e11 else stamp
+    except (ValueError, TypeError):
+        pass
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return dt.replace(tzinfo=dt.tzinfo or timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return 0.0
+
+
+def format_date(value: object) -> str:
+    stamp = to_timestamp(value)
+    if not stamp:
+        return "не указана"
+    try:
+        return datetime.fromtimestamp(stamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (OverflowError, OSError, ValueError):
+        return "не указана"
 
 
 def get_project_id(conv: dict) -> str | None:
-    """
-    Определяет проект по данным диалога.
-    В бэкапе ChatGPT проект задаётся полем gizmo_id (или conversation_template_id).
-    Возвращает ID проекта для имени папки или None — диалог вне проекта.
-    """
-    raw = conv.get("gizmo_id") or conv.get("conversation_template_id") or conv.get("metadata", {}).get("gizmo_id")
-    if not raw or not str(raw).strip():
-        return None
-    return str(raw).strip()
-
-
-def sanitize_folder_name(s: str) -> str:
-    """Имя папки проекта: только безопасные символы."""
-    # Заменяем все небезопасные символы на подчеркивание
-    # Включаем пробелы, управляющие символы, запрещенные для файловой системы
-    s = re.sub(r'[<>:"/\\|?*\s\r\n\t]', "_", s)
-    # Удаляем ведущие и конечные подчеркивания и точки
-    s = s.strip("_.")
-    # Заменяем множественные подчеркивания на одно
-    s = re.sub(r'_+', '_', s)
-    # Если после очистки строка пуста, используем значение по умолчанию
-    if not s:
-        s = "project"
-    # Ограничиваем длину
-    return s[:MAX_TITLE_LEN]
-
-
-def sanitize_filename(s: str) -> str:
-    # Заменяем все небезопасные символы на подчеркивание (включая пробелы)
-    s = re.sub(r'[<>:"/\\|?*\s\r\n\t]', "_", s)
-    # Удаляем ведущие и конечные подчеркивания и точки
-    s = s.strip("_.")
-    # Заменяем множественные подчеркивания на одно
-    s = re.sub(r'_+', '_', s)
-    # Если после очистки строка пуста, используем значение по умолчанию
-    if not s:
-        s = "untitled"
-    # Ограничиваем длину
-    return s[:MAX_TITLE_LEN]
-
-
-def build_file_map(base_path=None):
-    """Строит маппинг file_id / asset_pointer -> локальный путь."""
-    if base_path is None:
-        base_path = BASE
-    file_map = {}
-    
-    def add_mapping(fid, path):
-        """Добавляет отображение с дедупликацией: выбираем более полный путь."""
-        existing = file_map.get(fid)
-        if existing is None:
-            file_map[fid] = path
-        else:
-            # Выбираем путь с большей длиной (эвристика: более полный путь)
-            if len(str(path)) > len(str(existing)):
-                file_map[fid] = path
-            # Иначе оставляем существующий
-    
-    # Файлы в корневой папке (префикс file-)
-    for f in os.listdir(base_path):
-        path = base_path / f
-        if path.is_file() and f.startswith("file-"):
-            parts = f.split("-", 2)
-            if len(parts) >= 2:
-                fid = "file-" + parts[1]
-                add_mapping(fid, path)
-    
-    # Файлы в user-FpDwdx0tII6eDxp5lApJkSsL (префикс file_)
-    user_dir = base_path / "user-FpDwdx0tII6eDxp5lApJkSsL"
-    if user_dir.is_dir():
-        for f in os.listdir(user_dir):
-            if f.startswith("file_"):
-                # sediment://file_00000000c46061f9bd587888eb5e6ce5
-                h = f.split("-")[0]
-                add_mapping("sediment://" + h, user_dir / f)
-    
-    # Файлы в dalle-generations
-    dalle_dir = base_path / "dalle-generations"
-    if dalle_dir.is_dir():
-        for f in os.listdir(dalle_dir):
-            path = dalle_dir / f
-            if path.is_file() and f.startswith("file-"):
-                parts = f.split("-", 2)
-                if len(parts) >= 2:
-                    fid = "file-" + parts[1]
-                    add_mapping(fid, path)
-    
-    return file_map
-
-
-def resolve_asset_path(part: dict, file_map: dict) -> str | None:
-    if not isinstance(part, dict):
-        return None
-    ptr = part.get("asset_pointer")
-    if not ptr:
-        return None
-    # file-service://file-85nHsLezMWbFESUDBRMhQE
-    if "file-service://" in str(ptr):
-        fid = ptr.replace("file-service://", "").strip()
-        return str(file_map.get(fid)) if file_map.get(fid) else None
-    if str(ptr).startswith("sediment://"):
-        return str(file_map.get(ptr)) if file_map.get(ptr) else None
+    meta = conv.get("metadata") if isinstance(conv.get("metadata"), dict) else {}
+    for value in (conv.get("gizmo_id"), conv.get("project_id"), conv.get("conversation_template_id"),
+                  meta.get("project_id"), meta.get("gizmo_id"), meta.get("conversation_template_id")):
+        if value and str(value).strip():
+            return str(value).strip()
     return None
 
 
-def get_ordered_message_ids(mapping: dict) -> list[str]:
-    """
-    Возвращает список ID сообщений в хронологическом порядке, исключая системные.
-    Собирает все сообщения из mapping, имеющие message с ролью не system,
-    и сортирует по времени создания (create_time) если оно есть, иначе по ID.
-    """
-    candidates = []
-    for nid, node in mapping.items():
-        msg = node.get("message")
-        if not msg:
+def load_project_names(path: Path) -> dict[str, str]:
+    """Load an explicit ID-to-name mapping; unknown IDs retain their original value."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Файл проектов не найден: {path}")
+    with path.open("r", encoding="utf-8-sig") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("projects.json должен быть объектом {ID: название}")
+    names = {}
+    for project_id, name in data.items():
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("ID проекта должен быть непустой строкой")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Для проекта {project_id!r} требуется непустое название")
+        names[project_id.strip()] = name.strip()
+    return names
+
+
+def project_folder_names(ids: list[str], names: dict[str, str]) -> dict[str, str]:
+    """Resolve collisions deterministically, including collisions after sanitization."""
+    preferred = {pid: sanitize_filename(names.get(pid, pid), "project") for pid in ids}
+    occurrences = defaultdict(int)
+    for folder in preferred.values():
+        occurrences[folder.casefold()] += 1
+    used = set()
+    result = {}
+    for pid in sorted(ids):
+        base = preferred[pid]
+        if occurrences[base.casefold()] > 1:
+            suffix = "_" + hashlib.sha1(pid.encode("utf-8")).hexdigest()[:8]
+            base = base[:MAX_TITLE_LEN - len(suffix)] + suffix
+        name = base
+        n = 1
+        while name.casefold() in used:
+            n += 1
+            suffix = f"_{n}"
+            name = base[:MAX_TITLE_LEN - len(suffix)] + suffix
+        used.add(name.casefold())
+        result[pid] = name
+    return result
+
+
+def is_conv(obj: object) -> bool:
+    return isinstance(obj, dict) and (isinstance(obj.get("mapping"), dict) or isinstance(obj.get("messages"), list))
+
+
+def iter_conversations(doc: object):
+    if is_conv(doc):
+        yield doc
+    elif isinstance(doc, list):
+        for item in doc:
+            if is_conv(item):
+                yield item
+    elif isinstance(doc, dict):
+        for key in ("conversations", "items", "data"):
+            nested = doc.get(key)
+            if isinstance(nested, (list, dict)):
+                yield from iter_conversations(nested)
+
+
+def safe_extract(zf: zipfile.ZipFile, dest: Path, total: list[int]) -> None:
+    """Не разрешаем выход за каталог назначения или ZIP-симлинки."""
+    for info in zf.infolist():
+        # ZipInfo.external_attr: POSIX type 0o120000 is a symlink.
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            log_warning(f"Пропущен символический линк: {info.filename}")
             continue
-        role = msg.get("author", {}).get("role")
-        if role == "system":
+        relative = Path(info.filename.replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            log_warning(f"Пропущен небезопасный путь в ZIP: {info.filename}")
             continue
-        # Получаем время создания
-        create_time = msg.get("create_time")
-        # Если время None, используем 0
-        candidates.append((nid, create_time if create_time is not None else 0))
-    
-    # Сортировка по времени (возрастание), затем по ID для стабильности
-    candidates.sort(key=lambda x: (x[1], x[0]))
-    return [cid for cid, _ in candidates]
+        target = dest / relative
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        total[0] += info.file_size
+        if total[0] > MAX_UNCOMPRESSED_TOTAL:
+            raise ValueError("Превышен лимит распаковки 100 ГиБ; проверьте архив")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as source, target.open("wb") as output:
+            shutil.copyfileobj(source, output, length=1024 * 1024)
 
 
-def extract_parts_text_and_images(msg: dict, file_map: dict) -> tuple[list[str], list[tuple[str, str]]]:
-    """Возвращает (список текстовых частей, список (markdown_ref, local_path))."""
-    texts = []
-    images = []
-    content = msg.get("content") or {}
-    parts = content.get("parts") or []
-    for p in parts:
-        if isinstance(p, str) and p.strip():
-            texts.append(p.strip())
-        elif isinstance(p, dict):
-            if p.get("content_type") == "image_asset_pointer":
-                path = resolve_asset_path(p, file_map)
-                if path and os.path.isfile(path):
-                    images.append((path, path))
-            # текст внутри dict не трогаем
-    return texts, images
+def is_export_archive(path: Path) -> bool:
+    """Не раскрываем ZIP-документы, загруженные пользователем как вложения."""
+    return bool(re.match(r"^(conversations|files|openai|chatgpt|export|part[-_])", path.name, re.I))
 
 
-def export_conversation(conv: dict, folder_name: str, file_map: dict, project_folder: str | None = None, output_dir: Path = OUTPUT_DIR) -> None:
-    """Экспортирует один диалог. project_folder — папка проекта внутри output_dir или None для отдельного диалога."""
-    title = (conv.get("title") or "New chat").strip() or "Без названия"
-    cid = conv.get("id") or conv.get("conversation_id") or "conv"
-    create_ts = conv.get("create_time")
-    if create_ts:
+def prepare_roots(source: Path, work_dir: Path) -> list[Path]:
+    """Подключаем исходный каталог и вложенные ZIP; извлекаем только во временную папку."""
+    if source.is_file() and source.suffix.lower() == ".json":
+        return [source.parent]
+    roots: list[Path] = []
+    archives: list[tuple[Path, int]] = []
+    visited: set[Path] = set()
+    if source.is_dir():
+        roots.append(source)
+        archives.extend((item, 0) for item in source.rglob("*.zip") if item.is_file() and is_export_archive(item))
+    elif source.suffix.lower() == ".zip":
+        archives.append((source, 0))
+    else:
+        raise ValueError("Укажите каталог экспорта, JSON или ZIP")
+
+    total = [0]
+    archive_count = 0
+    while archives:
+        archive, level = archives.pop(0)
+        if archive in visited:
+            continue
+        visited.add(archive)
+        if level > MAX_NESTING:
+            log_warning(f"Слишком глубокая вложенность ZIP: {archive.name}")
+            continue
+        archive_count += 1
+        target = work_dir / f"archive_{archive_count:05d}"
         try:
-            dt = datetime.fromtimestamp(create_ts)
-            date_str = dt.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            date_str = ""
+            with zipfile.ZipFile(archive) as zf:
+                safe_extract(zf, target, total)
+        except (zipfile.BadZipFile, OSError, RuntimeError) as exc:
+            log_warning(f"Не удалось прочитать ZIP {archive}: {exc}")
+            continue
+        roots.append(target)
+        for child in target.rglob("*.zip"):
+            if child.is_file() and is_export_archive(child):
+                archives.append((child, level + 1))
+    return roots
+
+
+def find_conversations(roots: list[Path], source: Path, output_dir: Path) -> list[dict]:
+    paths: set[Path] = set()
+    if source.is_file() and source.suffix.lower() == ".json":
+        paths.add(source)
     else:
-        date_str = ""
-
-    if project_folder:
-        out_path = output_dir / project_folder / folder_name
-    else:
-        out_path = output_dir / folder_name
-    out_path.mkdir(parents=True, exist_ok=True)
-    assets_path = out_path / "assets"
-    assets_path.mkdir(exist_ok=True)
-    texts_path = out_path / "texts"
-    texts_path.mkdir(exist_ok=True)
-
-    mapping = conv.get("mapping") or {}
-    order = get_ordered_message_ids(mapping)
-    if not order:
-        return
-
-    md_lines = [
-        f"# {title}",
-        "",
-        f"*Дата: {date_str}*",
-        f"*ID: {cid}*",
-        "",
-        "---",
-        "",
-    ]
-    image_counter = 0
-    text_file_counter = 0
-    copied_images = set()
-
-    for pos, nid in enumerate(order):
-        node = mapping.get(nid)
-        if not node:
+        for root in roots:
+            for p in root.rglob("*.json"):
+                if output_dir == p or output_dir in p.parents:
+                    continue
+                if CONVERSATIONS_PATTERN.fullmatch(p.name):
+                    paths.add(p)
+    if not paths:
+        raise FileNotFoundError("Не найдены conversations.json или conversations-NNN.json")
+    conversations: dict[str, dict] = {}
+    for path in sorted(paths):
+        print(f"Чтение: {path.name}")
+        try:
+            with path.open("r", encoding="utf-8-sig") as stream:
+                doc = json.load(stream)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            log_warning(f"Пропущен JSON {path}: {exc}")
             continue
-        msg = node.get("message")
-        if not msg:
-            continue
-        author = msg.get("author") or {}
-        role = author.get("role") or "user"
-        if role == "system":
-            continue
-        name = "Пользователь" if role == "user" else "Ассистент"
-        texts, image_list = extract_parts_text_and_images(msg, file_map)
-
-        md_lines.append(f"## {name}")
-        md_lines.append("")
-
-        for t in texts:
-            if len(t) > LONG_TEXT_THRESHOLD:
-                text_file_counter += 1
-                fn = f"message_{pos+1}_{text_file_counter}.txt"
-                txt_path = texts_path / fn
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(t)
-                md_lines.append(f"*[Длинный текст сохранён в отдельный файл: [texts/{fn}](texts/{fn})]*")
-                md_lines.append("")
-                md_lines.append("<details><summary>Краткий фрагмент</summary>")
-                md_lines.append("")
-                md_lines.append("```")
-                md_lines.append(t[:500].replace("```", "` ` `") + ("..." if len(t) > 500 else ""))
-                md_lines.append("```")
-                md_lines.append("</details>")
-                md_lines.append("")
+        for conv in iter_conversations(doc):
+            cid = str(conv.get("id") or conv.get("conversation_id") or "")
+            if not cid:
+                cid = hashlib.sha1(json.dumps(conv, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:20]
+            previous = conversations.get(cid)
+            if previous is None:
+                conversations[cid] = conv
             else:
-                md_lines.append(t)
-                md_lines.append("")
+                def score(c):
+                    return (len(c.get("mapping") or c.get("messages") or []), to_timestamp(c.get("update_time")))
+                if score(conv) > score(previous):
+                    conversations[cid] = conv
+    if not conversations:
+        raise ValueError("В файлах JSON не найдено диалогов c mapping или messages")
+    return sorted(conversations.values(), key=lambda c: (to_timestamp(c.get("create_time")), str(c.get("id") or c.get("conversation_id") or "")))
 
-        for src_path, _ in image_list:
-            if src_path in copied_images:
+
+def asset_aliases(path: Path, root: Path) -> set[str]:
+    aliases = {path.name.casefold(), str(path.relative_to(root)).replace("\\", "/").casefold()}
+    for pattern in (FILE_DASH_PATTERN, FILE_UNDER_PATTERN):
+        match = pattern.search(path.name)
+        if match:
+            aliases.add(match.group(1).casefold())
+    # Файл file-...dat также доступен по полному имени без .dat.
+    if path.suffix.lower() == ".dat":
+        aliases.add(path.stem.casefold())
+    return aliases
+
+
+def build_file_map(roots: list[Path], output_dir: Path) -> dict[str, Path]:
+    lookup: dict[str, Path] = {}
+    count = 0
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file() or output_dir in path.parents:
                 continue
-            image_counter += 1
-            ext = Path(src_path).suffix or ".png"
-            dest_name = f"image_{image_counter}{ext}"
-            dest_path = assets_path / dest_name
-            try:
-                shutil.copy2(src_path, dest_path)
-                copied_images.add(src_path)
-            except Exception:
-                dest_name = ""
-            if dest_name:
-                md_lines.append(f"![Изображение](assets/{dest_name})")
-                md_lines.append("")
-
-        md_lines.append("")
-
-    dialogue_md = out_path / "dialogue.md"
-    with open(dialogue_md, "w", encoding="utf-8") as f:
-        f.write("\n".join(md_lines))
-
-    # Пустые папки texts можно не оставлять — но оставим для единообразия
-    if not list(texts_path.iterdir()):
-        texts_path.rmdir()
+            if path.suffix.lower() in {".json", ".zip", ".html"}:
+                continue
+            count += 1
+            for key in asset_aliases(path, root):
+                # Полное имя файла обычно надёжнее алиаса file-id.
+                lookup.setdefault(key, path)
+    print(f"Файлов вложений проиндексировано: {count}")
+    return lookup
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='Экспорт диалогов ChatGPT из папки бэкапа.')
-    parser.add_argument('path', nargs='?', default='.', help='Путь к папке с бэкапом (по умолчанию текущая директория)')
-    args = parser.parse_args()
+def asset_candidates(value: object) -> list[str]:
+    if not isinstance(value, str) or not value.strip():
+        return []
+    raw = unquote(value.strip()).replace("\\", "/")
+    candidates = [raw.casefold()]
+    # file-service://file-XXX, sediment://file_XXX, https://.../file-XXX
+    parsed = urlparse(raw)
+    if parsed.scheme:
+        if parsed.netloc:
+            candidates.append(parsed.netloc.casefold())
+        if parsed.path:
+            candidates.append(parsed.path.lstrip("/").casefold())
+    candidates.append(raw.rsplit("/", 1)[-1].casefold())
+    for pattern in (FILE_DASH_PATTERN, FILE_UNDER_PATTERN):
+        match = pattern.search(raw)
+        if match:
+            candidates.append(match.group(1).casefold())
+    return list(dict.fromkeys(candidates))
 
-    base_path = Path(args.path).resolve()
-    conversations_json = base_path / "conversations.json"
-    output_dir = base_path / "dialogs_export"
 
-    if not conversations_json.exists():
-        print(f"Файл conversations.json не найден в {base_path}.")
-        return
-    with open(conversations_json, "r", encoding="utf-8") as f:
-        conversations = json.load(f)
-    if not isinstance(conversations, list):
-        conversations = [conversations]
+def resolve_asset(obj: dict, lookup: dict[str, Path]) -> Path | None:
+    for key in ("asset_pointer", "file_id", "id", "path", "file_path", "filename", "name", "url"):
+        value = obj.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("path")
+        for candidate in asset_candidates(value):
+            if candidate in lookup:
+                return lookup[candidate]
+    return None
 
-    def sort_key(c):
-        t = c.get("create_time") or 0
-        return (t, c.get("id", ""))
 
-    conversations.sort(key=sort_key)
+def sniff_extension(source: Path) -> str:
+    ext = source.suffix.lower()
+    if ext not in {"", ".dat", ".bin"}:
+        return ext if re.fullmatch(r"\.[a-z0-9]{1,10}", ext) else ".bin"
+    try:
+        with source.open("rb") as file:
+            header = file.read(64)
+    except OSError:
+        return ".bin"
+    checks = (
+        (b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"),
+        (b"GIF87a", ".gif"), (b"GIF89a", ".gif"), (b"%PDF-", ".pdf"),
+        (b"PK\x03\x04", ".zip"), (b"ID3", ".mp3"),
+        (b"OggS", ".ogg"), (b"fLaC", ".flac"),
+    )
+    for magic, extension in checks:
+        if header.startswith(magic):
+            return extension
+    if header.startswith(b"RIFF"):
+        if header[8:12] == b"WEBP":
+            return ".webp"
+        if header[8:12] == b"WAVE":
+            return ".wav"
+    if header[4:8] == b"ftyp":
+        return ".m4a" if b"M4A" in header[:20] else ".mp4"
+    if header.startswith((b"<?xml", b"<svg")) and b"<svg" in header:
+        return ".svg"
+    if header.startswith(b"\x1aE\xdf\xa3"):
+        return ".webm"
+    return ".bin"
 
-    # Распределение по проектам: проект задаётся полем gizmo_id / conversation_template_id
-    by_project = {}  # project_id -> [conv, ...]
-    standalone = []
-    for conv in conversations:
-        project_id = get_project_id(conv)
-        if project_id:
-            by_project.setdefault(project_id, []).append(conv)
+
+def get_ordered_messages(conv: dict, all_branches: bool = False) -> list[dict]:
+    mapping = conv.get("mapping")
+    if isinstance(mapping, dict) and mapping:
+        ids = []
+        current = conv.get("current_node")
+        if not all_branches and current in mapping:
+            seen: set[str] = set()
+            while current in mapping and current not in seen:
+                seen.add(current)
+                ids.append(current)
+                current = mapping[current].get("parent") if isinstance(mapping[current], dict) else None
+            ids.reverse()
         else:
-            standalone.append(conv)
+            if not all_branches:
+                log_warning(f"У диалога {conv.get('title')} нет корректного current_node: сохранены все ветки")
+            ids = sorted(mapping, key=lambda n: (
+                to_timestamp(((mapping[n] or {}).get("message") or {}).get("create_time")) if isinstance(mapping[n], dict) else 0,
+                str(n),
+            ))
+        return [mapping[n]["message"] for n in ids if isinstance(mapping[n], dict) and isinstance(mapping[n].get("message"), dict)]
+    messages = conv.get("messages") or []
+    page_info = conv.get("page_info") or {}
+    if isinstance(page_info, dict) and page_info.get("has_previous_page"):
+        log_warning(f"У диалога {conv.get('title')} есть другие страницы сообщений: экспорт может быть неполным")
+    result = []
+    for entry in messages:
+        if not isinstance(entry, dict):
+            continue
+        msg = entry.get("message") if isinstance(entry.get("message"), dict) else entry
+        if isinstance(msg, dict):
+            result.append(msg)
+    return result
 
-    file_map = build_file_map(base_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    exported = 0
 
-    for project_id, convs in sorted(by_project.items()):
-        project_folder = sanitize_folder_name(project_id)
-        (output_dir / project_folder).mkdir(parents=True, exist_ok=True)
-        convs.sort(key=sort_key)
-        for local_i, conv in enumerate(convs, 1):
-            title = (conv.get("title") or "New chat").strip() or "Без названия"
-            folder_name = f"{local_i:03d}_{sanitize_filename(title)}"
+def extract_text_and_media(msg: dict) -> tuple[list[tuple[str, object]], list[dict]]:
+    """Сохраняем порядок мультимодальных частей, а вложения возвращаем отдельно."""
+    content = msg.get("content") or {}
+    result: list[tuple[str, object]] = []
+    if isinstance(content, str):
+        if content.strip():
+            result.append(("text", content.strip()))
+    elif isinstance(content, dict):
+        parts = content.get("parts")
+        if isinstance(parts, list):
+            for p in parts:
+                if isinstance(p, str):
+                    if p.strip():
+                        result.append(("text", p.strip()))
+                elif isinstance(p, dict):
+                    kind = str(p.get("content_type") or p.get("type") or "")
+                    if kind in {"image_asset_pointer", "audio_asset_pointer", "video_asset_pointer", "file_asset_pointer"} or p.get("asset_pointer"):
+                        result.append(("media", p))
+                    elif kind in {"text", "input_text", "text_part"} and isinstance(p.get("text"), str):
+                        result.append(("text", p["text"]))
+                    elif kind in {"audio_transcription", "text_audio", "text_sentinel", "transcription"}:
+                        val = p.get("text") or p.get("transcript") or p.get("transcription")
+                        if isinstance(val, str):
+                            result.append(("text", val))
+                    elif isinstance(p.get("text"), str):
+                        result.append(("text", p["text"]))
+                    elif kind:
+                        result.append(("note", f"[Неподдерживаемая часть: {kind}]"))
+        elif isinstance(content.get("text"), str):
+            result.append(("text", content["text"]))
+        elif isinstance(content.get("content"), str):
+            result.append(("text", content["content"]))
+        elif isinstance(content.get("transcript"), str):
+            result.append(("text", content["transcript"]))
+        elif isinstance(content.get("summary"), str):
+            result.append(("text", content["summary"]))
+        elif content.get("content_type"):
+            result.append(("note", f"[Неподдерживаемое содержимое: {content['content_type']}]") )
+    meta = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+    attachments = meta.get("attachments") or msg.get("attachments") or []
+    if not isinstance(attachments, list):
+        attachments = []
+    return result, [a for a in attachments if isinstance(a, dict)]
+
+
+def write_long_text(text: str, texts_dir: Path, ordinal: int, number: int, lines: list[str]) -> None:
+    if len(text) <= LONG_TEXT_THRESHOLD:
+        lines.extend((text, ""))
+        return
+    texts_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"message_{ordinal}_{number}.txt"
+    (texts_dir / filename).write_text(text, encoding="utf-8")
+    lines.extend((f"*Длинный текст: [texts/{filename}](texts/{filename})*", "",
+                  "<details><summary>Первые 500 символов</summary>", "",
+                  "~~~~text", text[:500].replace("~~~~", "~ ~ ~ ~") + ("…" if len(text) > 500 else ""),
+                  "~~~~", "", "</details>", ""))
+
+
+def export_conversation(conv: dict, out_path: Path, lookup: dict[str, Path], all_branches: bool = False) -> tuple[bool, int]:
+    messages = get_ordered_messages(conv, all_branches)
+    if not messages:
+        return False, 0
+    out_path.mkdir(parents=True, exist_ok=True)
+    assets_dir = out_path / "assets"
+    texts_dir = out_path / "texts"
+    title = str(conv.get("title") or "Без названия").strip()
+    cid = str(conv.get("id") or conv.get("conversation_id") or "не указан")
+    lines = [f"# {markdown_escape(title)}", "", f"*Дата: {format_date(conv.get('create_time'))}*",
+             f"*ID: `{markdown_escape(cid)}`*", "", "---", ""]
+    used_assets: dict[Path, str] = {}
+    missing_count = 0
+    text_counter = 0
+    message_no = 0
+
+    def attach(part: dict, explicit_name: str = "", image_hint: bool = False) -> str:
+        nonlocal missing_count
+        src = resolve_asset(part, lookup)
+        description = explicit_name or str(part.get("name") or part.get("filename") or part.get("asset_pointer") or part.get("id") or "вложение")
+        if not src:
+            missing_count += 1
+            return f"*Вложение не найдено в экспорте: {markdown_escape(description)}*"
+        if src not in used_assets:
+            assets_dir.mkdir(exist_ok=True)
+            extension = sniff_extension(src)
+            # Для .dat оригинальное имя из attachments точнее сигнатуры ZIP
+            # (например, документ .docx внутри тоже начинается с PK).
+            named_extension = Path(explicit_name).suffix.lower() if explicit_name else ""
+            if src.suffix.lower() in {"", ".dat", ".bin"} and re.fullmatch(r"\.[a-z0-9]{1,10}", named_extension):
+                extension = named_extension
+            basename = sanitize_filename(Path(explicit_name).stem, "file") if explicit_name else "asset"
+            dest_name = f"{len(used_assets)+1:04d}_{basename}{extension}"
             try:
-                export_conversation(conv, folder_name, file_map, project_folder=project_folder, output_dir=output_dir)
-                exported += 1
-                print(f"  [{project_folder}] {folder_name} — {title[:50]}")
-            except Exception as e:
-                print(f"Ошибка: {project_folder}/{folder_name}: {e}")
-                import traceback
-                traceback.print_exc()
+                shutil.copy2(src, assets_dir / dest_name)
+            except OSError as exc:
+                missing_count += 1
+                return f"*Ошибка копирования вложения {markdown_escape(description)}: {exc}*"
+            used_assets[src] = dest_name
+        file_name = used_assets[src]
+        target = f"assets/{md_url(file_name)}"
+        if image_hint or Path(file_name).suffix.lower() in IMAGE_TYPES:
+            return f"![{markdown_escape(explicit_name or 'Изображение')}]({target})"
+        return f"[Файл: {markdown_escape(explicit_name or src.name)}]({target})"
 
-    for i, conv in enumerate(standalone, 1):
-        title = (conv.get("title") or "New chat").strip() or "Без названия"
-        folder_name = f"{i:03d}_{sanitize_filename(title)}"
-        try:
-            export_conversation(conv, folder_name, file_map, project_folder=None, output_dir=output_dir)
-            exported += 1
-            print(f"  (отдельный) {folder_name} — {title[:50]}")
-        except Exception as e:
-            print(f"Ошибка: {folder_name}: {e}")
-            import traceback
-            traceback.print_exc()
+    for msg in messages:
+        author = msg.get("author") or {}
+        role = author.get("role") if isinstance(author, dict) else author
+        if role not in ("user", "assistant"):
+            continue
+        metadata = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+        if metadata.get("is_visually_hidden_from_conversation"):
+            continue
+        if role == "assistant" and msg.get("recipient") not in (None, "all", ""):
+            continue
+        parts, attachments = extract_text_and_media(msg)
+        if not parts and not attachments:
+            continue
+        message_no += 1
+        lines.extend((f"## {'Пользователь' if role == 'user' else 'Ассистент'}", ""))
+        seen_message_assets: set[Path] = set()
+        for kind, payload in parts:
+            if kind == "text":
+                text_counter += 1
+                write_long_text(str(payload), texts_dir, message_no, text_counter, lines)
+            elif kind == "media" and isinstance(payload, dict):
+                path = resolve_asset(payload, lookup)
+                if path:
+                    seen_message_assets.add(path)
+                hint = payload.get("content_type") == "image_asset_pointer"
+                lines.extend((attach(payload, image_hint=hint), ""))
+            elif kind == "note":
+                lines.extend((str(payload), ""))
+        for attachment in attachments:
+            path = resolve_asset(attachment, lookup)
+            if path and path in seen_message_assets:
+                continue
+            if path:
+                seen_message_assets.add(path)
+            name = str(attachment.get("name") or attachment.get("filename") or "")
+            lines.extend((attach(attachment, explicit_name=name), ""))
+    (out_path / "dialogue.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True, missing_count
 
-    # README: структура и пояснение
-    write_export_readme(by_project, standalone, output_dir=output_dir)
 
-    print(f"\nГотово. Экспортировано {exported} диалогов.")
-    print(f"  Проектов (по gizmo_id/conversation_template_id): {len(by_project)}")
-    print(f"  Отдельных диалогов (без проекта): {len(standalone)}")
-    print(f"Папка: {output_dir}")
-
-
-def write_export_readme(by_project: dict, standalone: list, output_dir: Path = OUTPUT_DIR) -> None:
-    """Пишет README.md в output_dir с описанием структуры."""
-    def sort_key(c):
-        t = c.get("create_time") or 0
-        return (t, c.get("id", ""))
-
-    lines = [
-        "# Экспорт диалогов ChatGPT",
-        "",
-        "Проект в данных задаётся полем **gizmo_id** (или **conversation_template_id**) у диалога.",
-        "Если поле задано — диалог лежит в папке проекта; иначе — в «Отдельные диалоги».",
-        "",
-        "В каждой папке диалога: `dialogue.md`, при необходимости `texts/`, `assets/`.",
-        "",
-        "---",
-        "",
-        "## Проекты (по gizmo_id)",
-        "",
-    ]
-    for project_id in sorted(by_project.keys()):
-        folder = sanitize_folder_name(project_id)
-        convs = by_project[project_id]
-        convs_sorted = sorted(convs, key=sort_key)
-        lines.append(f"### {folder}")
-        lines.append(f"*(id: `{project_id}`)*")
+def write_export_readme(by_project: dict[str, list[tuple[dict, Path]]], standalone: list[tuple[dict, Path]],
+                        output_dir: Path, missing_count: int, project_names: dict[str, str]) -> None:
+    lines = ["# Экспорт диалогов ChatGPT", "", "Каждый диалог хранится в `dialogue.md`.",
+             "Длинные сообщения — в `texts/`, найденные вложения — в `assets/`.",
+             "Проекты сгруппированы по `gizmo_id`, `project_id` или `conversation_template_id`.", ""]
+    if missing_count:
+        lines.extend((f"*Внимание: не удалось найти или скопировать {missing_count} вложений.*", ""))
+    lines.extend(("## Проекты", ""))
+    for project_id, group in sorted(by_project.items()):
+        display_name = project_names.get(project_id, project_id)
+        lines.extend((f"### {markdown_escape(display_name)}", f"*ID: \`{markdown_escape(project_id)}\`*", ""))
+        for conv, rel in group:
+            lines.append(f"- [{markdown_escape(conv.get('title') or 'Без названия')}]({md_url(rel / 'dialogue.md')})")
         lines.append("")
-        for i, conv in enumerate(convs_sorted, 1):
-            title = (conv.get("title") or "New chat").strip() or "Без названия"
-            sub = f"{i:03d}_{sanitize_filename(title)}"
-            lines.append(f"- [{title}]({folder}/{sub}/dialogue.md)")
-        lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("## Отдельные диалоги")
-    lines.append("")
-    standalone_sorted = sorted(standalone, key=sort_key)
-    for i, conv in enumerate(standalone_sorted, 1):
-        title = (conv.get("title") or "New chat").strip() or "Без названия"
-        sub = f"{i:03d}_{sanitize_filename(title)}"
-        lines.append(f"- [{title}]({sub}/dialogue.md)")
+    lines.extend(("## Отдельные диалоги", ""))
+    for conv, rel in standalone:
+        lines.append(f"- [{markdown_escape(conv.get('title') or 'Без названия')}]({md_url(rel / 'dialogue.md')})")
     lines.append("")
     (output_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Перевод архива ChatGPT (ZIP, JSON, каталог) в папки с Markdown.")
+    parser.add_argument("path", nargs="?", default=".", help="Каталог, JSON или ZIP с данными экспорта")
+    parser.add_argument("-o", "--output", help="Папка результата (по умолчанию dialogs_export рядом с источником)")
+    parser.add_argument("--all-branches", action="store_true", help="Выгружать все ветки mapping, включая альтернативные ответы")
+    parser.add_argument("--projects", type=Path, help="JSON-словарь ID проектов и названий (по умолчанию projects.json рядом со скриптом, если существует)")
+    args = parser.parse_args(argv)
+    source = Path(args.path).expanduser().resolve()
+    if not source.exists():
+        parser.error(f"Путь не найден: {source}")
+    output_dir = Path(args.output).expanduser().resolve() if args.output else (
+        source / "dialogs_export" if source.is_dir() else source.parent / "dialogs_export")
+    if source.is_dir() and output_dir == source:
+        parser.error("Папка результата должна отличаться от исходного каталога")
+    projects_path = args.projects.expanduser().resolve() if args.projects else Path(__file__).resolve().with_name("projects.json")
+    project_names = load_project_names(projects_path) if args.projects or projects_path.is_file() else {}
+    with tempfile.TemporaryDirectory(prefix="chatgpt_export_") as tmp:
+        roots = prepare_roots(source, Path(tmp))
+        conversations = find_conversations(roots, source, output_dir)
+        lookup = build_file_map(roots, output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        groups: dict[str, list[dict]] = defaultdict(list)
+        standalone_convs: list[dict] = []
+        for conv in conversations:
+            project = get_project_id(conv)
+            (groups[project] if project else standalone_convs).append(conv)
+
+        processed_projects: dict[str, list[tuple[dict, Path]]] = defaultdict(list)
+        processed_standalone: list[tuple[dict, Path]] = []
+        exported = missing = 0
+        folder_names = project_folder_names(list(groups), project_names)
+        for project_id in sorted(groups):
+            name = folder_names[project_id]
+            for i, conv in enumerate(groups[project_id], 1):
+                rel = Path("projects") / name / f"{i:03d}_{sanitize_filename(conv.get('title') or 'New_chat')}"
+                try:
+                    created, not_found = export_conversation(conv, output_dir / rel, lookup, args.all_branches)
+                    if created:
+                        exported += 1
+                        missing += not_found
+                        processed_projects[project_id].append((conv, rel))
+                        print(f"  [{name}] {rel.name}")
+                except Exception as exc:
+                    log_warning(f"Ошибка диалога {rel}: {exc}")
+        for i, conv in enumerate(standalone_convs, 1):
+            rel = Path("chats") / f"{i:03d}_{sanitize_filename(conv.get('title') or 'New_chat')}"
+            try:
+                created, not_found = export_conversation(conv, output_dir / rel, lookup, args.all_branches)
+                if created:
+                    exported += 1
+                    missing += not_found
+                    processed_standalone.append((conv, rel))
+                    print(f"  (отдельный) {rel.name}")
+            except Exception as exc:
+                log_warning(f"Ошибка диалога {rel}: {exc}")
+        write_export_readme(processed_projects, processed_standalone, output_dir, missing, project_names)
+        print(f"\nГотово. Экспортировано: {exported} из {len(conversations)}. "
+              f"Проектов: {len(processed_projects)}. Отдельных: {len(processed_standalone)}. "
+              f"Ненайденных вложений: {missing}.\nРезультат: {output_dir}")
+        return 0 if exported else 1
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        sys.exit(1)

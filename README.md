@@ -1,21 +1,46 @@
-## Папка для тестов
+# ChatGPT Export Dialog
 
-`/home/boldyreva/data/backups/chatgpt/d7121b61747acfeabe78902faa127a52eb9ee4c002064319c54b2e0664cb1900-2026-02-08-07-14-49-6abfa7a7aa674836b912a3aa6ee13a7a`
+Экспортирует диалоги ChatGPT в Markdown. Python 3.10+, сторонние зависимости не требуются.
 
-## Команда
+## Запуск
 
 ```bash
-python3 ./export_dialogs.py /home/boldyreva/data/backups/chatgpt/d7121b61747acfeabe78902faa127a52eb9ee4c002064319c54b2e0664cb1900-2026-10-08-13-45-46-cd5f78b26b3942158ce574bcb2a9efc6
+python3 export_dialogs.py /path/to/chatgpt-export.zip
+python3 export_dialogs.py /path/to/unpacked-export -o /path/to/output
+python3 export_dialogs.py /path/to/conversations.json --all-branches
 ```
 
+Скрипт поддерживает ZIP, каталоги экспорта и файлы JSON. По умолчанию создаёт `dialogs_export` рядом с источником.
 
-Как запустить
-Для ZIP-архива:
-python export_dialogs_updated.py "путь/к/export.zip"
+## Названия проектов
 
+Создайте `projects.json` рядом с `export_dialogs.py`, взяв за основу `projects.example.json`:
 
-Для распакованной папки:
-python export_dialogs_updated.py "путь/к/экспорту"
+```json
+{
+  "g-p-123456": "Hermes Agent",
+  "g-p-abcdef": "RimWorld"
+}
+```
 
+Ключ — точный ID проекта из `gizmo_id`, `project_id` или `conversation_template_id` в экспорте, значение — его название. Можно указать другой файл: `--projects /path/to/projects.json`. Если файл не задан и отсутствует рядом со скриптом, экспорт работает без сопоставлений. Если ID не найден в словаре, в качестве названия остаётся ID. Для двух проектов с одинаковым или совпавшим после нормализации названием автоматически добавляется уникальный суффикс, поэтому файлы не смешиваются.
 
-Для сохранения всех альтернативных веток ответов добавьте --all-branches.
+## Структура
+
+```text
+dialogs_export/
+├── README.md
+├── projects/
+│   └── Hermes_Agent/
+│       └── 001_Название_диалога/
+│           ├── dialogue.md
+│           ├── assets/ (при наличии)
+│           └── texts/ (при наличии)
+└── chats/
+    └── 001_Обычный_диалог/
+        └── dialogue.md
+```
+
+В README результата отображаются названия проектов, их исходные ID и ссылки на диалоги. `--all-branches` сохраняет альтернативные ветки бесед. Исходный экспорт не изменяется.
+
+Файл `export_dialogs_26.10.21.py` оставлен как историческая версия; актуальная точка входа — `export_dialogs.py`.
